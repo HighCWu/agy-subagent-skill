@@ -1,6 +1,6 @@
 ---
 name: agy-subagent
-description: Use Antigravity CLI (agy) through Codex-shaped subagent operations and JSON arguments such as spawn_agent, send_message, followup_task, wait_agent, and interrupt_agent. Use when delegating implementation, investigation, review, or a second opinion to agy or Antigravity.
+description: Delegate tasks to Antigravity CLI (agy) with Codex-shaped subagent operations, messaging, waiting, historical forks, retries, rewind, and summary-based context. Use when delegating work to agy or managing its agent conversations.
 ---
 
 # agy 子代理
@@ -82,5 +82,19 @@ JSON
 会话默认根据 `CODEX_THREAD_ID` 隔离，agy 子代理自动继承所属会话。脱离 Codex 时，可设置固定 `AGY_SUBAGENT_SESSION` 以便跨目录访问同一组代理。
 
 状态与日志默认保存在 `~/.local/state/agy-subagent/`。顶层参数 `--state-dir` 或环境变量 `AGY_SUBAGENT_STATE_DIR` 可更改位置。诊断时可调用旧接口 `result AGENT_ID` 查看本轮结构化结果与日志目录。关闭和中断保留已有修改及记录，重试前核查副作用。
+
+## 历史分叉与节省上下文
+
+先用 `list_turns` 取得轮次 ID，然后按目标选择扩展操作。
+
+- `fork_agent` 使用 `target`、`task_name`、`message`，通过可选 `last_turn_id` 从已完成轮次结束处分叉。
+- `retry_agent` 使用 `target`、`task_name`、`turn_id`，从该轮开始前重新尝试，默认复用该轮输入，支持替换 `message`。
+- `rewind_agent` 使用 `target`、`before_turn_id`，将原句柄退回该轮开始前，随后用 `followup_task` 继续。
+
+这些操作支持 `context_mode` 为 `full`、`summary` 或 `none`。摘要模式由调用方通过 `context_summary` 提供必要背景，可省去完整历史。分叉和重试还支持覆盖 `model`、`reasoning_effort`、`cwd` 与 `agy` 配置。
+
+历史重建通过新的 agy conversation 执行。回退会归档旧记录和待投递消息，当前队列会清空。文件使用当前工作目录状态。结果事件的 `turn_id` 和 `history_revision` 用于识别轮次，`superseded=true` 表示该结果属于已被回退替代的历史版本。
+
+使用这些扩展时阅读 [references/history.md](references/history.md)，了解边界选择、摘要示例、旧记录迁移与历史恢复。
 
 接口差异、状态恢复和旧版命令说明见 [references/behavior.md](references/behavior.md)。

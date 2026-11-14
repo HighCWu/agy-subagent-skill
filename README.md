@@ -57,12 +57,33 @@ JSON
 
 本实现通过本地脚本和 agy print 协议编排。消息在完整轮次边界投递，即时改向可中断后追加任务。操作结果通过脚本返回。详细语义与原生运行时差异见 [技能说明](agy-subagent/SKILL.md) 和 [接口与运行边界](agy-subagent/references/behavior.md)。旧版 CLI 命令和任务记录继续兼容。
 
+## 历史分叉和上下文压缩
+
+新增 `list_turns`、`fork_agent`、`retry_agent` 和 `rewind_agent`。使用 `list_turns` 返回的稳定轮次 ID，可从早期历史探索不同方案，或重新生成某一轮的回答。
+
+```json
+{
+  "target": "investigate_cache",
+  "task_name": "alternative_plan",
+  "last_turn_id": "TURN_ID",
+  "message": "从这里给出另一种实现方案。",
+  "context_mode": "summary",
+  "context_summary": "缓存键需要包含租户ID，修改范围为 src/cache.py。"
+}
+```
+
+将 `TURN_ID` 替换为实际轮次 ID，作为 `fork_agent` 的 JSON 参数传入。`context_mode` 默认 `full`，`summary` 使用调用方提供的摘要，`none` 使用空历史。分支可指定不同 `model` 或 `reasoning_effort`。
+
+`retry_agent` 保留目标轮次之前的历史并复用输入，可通过 `message` 更换提示词。`rewind_agent` 将原句柄回退到 `before_turn_id` 开始前，接着用 `followup_task` 继续。新方向会使用新的 agy conversation，旧历史和消息队列会归档。
+
+这些操作处理聊天上下文，工作目录使用当前文件状态。完整参数和示例见 [历史能力说明](agy-subagent/references/history.md)。
+
 ## 验证
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖 JSON 参数、真实角色指令、上下文分支、聊天隔离、任务路径、嵌套代理、消息邮箱、并发追加、关闭恢复、超时中断及旧接口兼容。开发中也验证了真实 agy 的运行中排队与同会话续接。
+测试覆盖 JSON 参数、角色指令、上下文分支、聊天隔离、消息邮箱、并发追加、关闭恢复、历史分叉、指定轮次重试、摘要上下文、回退隔离、历史恢复及旧记录迁移。开发中也验证了真实 agy 的运行中排队与同会话续接。
 
 参考 [Codex 子代理官方文档](https://learn.chatgpt.com/docs/agent-configuration/subagents) 和 [sysCat64/codex-agy-plugin](https://github.com/sysCat64/codex-agy-plugin) 的 print 模式集成思路。

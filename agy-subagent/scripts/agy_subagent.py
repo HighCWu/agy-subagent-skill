@@ -67,11 +67,18 @@ def prompt_from(args):
     return prompt
 
 
-def launch(directory, state, prompt):
+def launch(directory, state, prompt, message=None):
     run_id = uuid.uuid4().hex
     run = directory / run_id
     run.mkdir(mode=0o700)
-    write_json(run / 'request.json', {'prompt': prompt, 'conversation_id': state.get('conversation_id')})
+    request = {'prompt': prompt, 'message': prompt if message is None else message,
+               'conversation_id': state.get('conversation_id'), 'started_at': time.time()}
+    if state.get('session_id'):
+        import history_ops
+        history_ops.ensure_history(directory, state)
+        request.update(previous_run_id=state.get('history_head'), history_seed=state['history_seed'])
+        state['history_head'] = run_id
+    write_json(run / 'request.json', request)
     state.update(status='running', run_id=run_id, started_at=time.time(),
                  error=None, exit_code=None, supervisor_pid=None, finished_at=None)
     state['turn'] = state.get('turn', 0) + 1
@@ -108,7 +115,11 @@ def spawn(args, root):
                  timeout=args.timeout, conversation_id=None)
     state.update(getattr(args, 'metadata', {}))
     with locked(directory):
-        return launch(directory, state, prompt)
+        if hasattr(args, 'history_seed'):
+            import history_ops
+            state.update(history_version=1, history_seed=history_ops.save_seed(directory, args.history_seed),
+                         history_head=None, history_revision=0)
+        return launch(directory, state, prompt, message=getattr(args, 'logical_message', prompt))
 
 
 def build_command(state, request):
@@ -375,7 +386,7 @@ def main():
         emit(state)
     elif args.command == 'result':
         state = snapshot(directory)
-        path = directory / state['run_id'] / 'result.json'
+        path = directory / state['run_id'] / 'result.json' if state.get('run_id') else directory / 'result.json'
         emit({'task': state, 'output': read_json(path) if path.exists() else None,
               'artifacts_dir': str(path.parent)})
     elif args.command == 'send':

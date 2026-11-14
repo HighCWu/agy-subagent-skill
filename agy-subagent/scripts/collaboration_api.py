@@ -1,5 +1,6 @@
 """Codex-shaped collaboration operations backed by the agy task runner."""
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -11,6 +12,7 @@ import time
 import uuid
 
 import agy_subagent as runner
+import history_ops
 
 # These field names mirror the collaboration tools exposed in Codex desktop.
 OPERATIONS = {
@@ -34,6 +36,7 @@ OPERATIONS = {
     'wait_agent': {'properties': {'timeout_ms': {'type': 'integer', 'minimum': 0,
                                                'maximum': 3600000}}},
 }
+OPERATIONS.update(history_ops.OPERATIONS)
 AGY_OPTIONS = {
     'bin': {'type': 'string'}, 'mode': {'type': 'string', 'enum': ['plan', 'accept-edits', 'auto']},
     'agent': {'type': 'string'}, 'project': {'type': 'string'},
@@ -88,10 +91,12 @@ def validate(value, schema, location='arguments'):
 def schemas():
     result = {}
     for operation, fields in OPERATIONS.items():
-        schema = dict(type='object', additionalProperties=False, **fields)
+        schema = dict(type='object', additionalProperties=False, **copy.deepcopy(fields))
         result[operation] = schema
-    result['spawn_agent']['properties']['agy'] = {
-        'type': 'object', 'properties': AGY_OPTIONS, 'additionalProperties': False}
+    for schema in result.values():
+        if 'agy' in schema['properties']:
+            schema['properties']['agy'] = {
+                'type': 'object', 'properties': AGY_OPTIONS, 'additionalProperties': False}
     return result
 
 
@@ -131,7 +136,9 @@ def view(state):
     return {'agent_id': state['id'], 'task_name': state.get('task_name', state['name']),
             'agent_type': state['role'], 'status': state['status'],
             'turn': state['turn'], 'pending_messages': len(state.get('pending_messages', [])),
-            'conversation_id': state.get('conversation_id'), 'error': state.get('error')}
+            'conversation_id': state.get('conversation_id'), 'error': state.get('error'),
+            'turn_id': state.get('run_id'), 'history_revision': state.get('history_revision', 0),
+            'forked_from': state.get('forked_from')}
 
 
 def publish(root, session, event):
@@ -146,14 +153,9 @@ def conversation_context(root, session):
     parent = sender()
     if parent != '/root':
         directory = resolve(root, session, parent)
-        requests = sorted(directory.glob('*/request.json'), key=lambda p: p.stat().st_mtime_ns)
-        parts = []
-        for path in requests:
-            parts.append('user\n' + runner.read_json(path)['prompt'])
-            result = path.parent / 'result.json'
-            if result.exists():
-                parts.append('assistant\n' + (runner.read_json(result).get('result') or {}).get('response', ''))
-        return '\n\n'.join(parts), 'parent-agent-history'
+        with runner.locked(directory):
+            state = runner.read_json(directory / 'state.json')
+            return history_ops.render(history_ops.snapshot(directory, state)), 'parent-agent-history'
     thread = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CODEX_SESSION_ID')
     if not thread or not re.fullmatch(r'[a-zA-Z0-9_-]+', thread):
         return '', 'unavailable'
@@ -179,7 +181,7 @@ def conversation_context(root, session):
     return '\n\n'.join(parts), 'codex-chat-messages' if parts else 'unavailable'
 
 
-def start_agent(root, session, args):
+def start_agent(root, session, args, seed_snapshot=None, lineage=None, inherited_state=None):
     role = args.get('agent_type', 'default')
     if role not in ROLES:
         raise ValueError('agent_type must be default, worker, explorer, or reviewer. '
@@ -190,7 +192,11 @@ def start_agent(root, session, args):
     if 'parent_context' in args and 'context_file' in args:
         raise ValueError('Choose parent_context or context_file')
     context, source = '', 'none'
-    if fork == 'all':
+    if seed_snapshot is not None:
+        mode = lineage['context_mode']
+        context = history_ops.render(seed_snapshot) if mode != 'none' else ''
+        source, fork = 'history-' + mode, 'none' if mode == 'none' else 'all'
+    elif fork == 'all':
         if 'parent_context' in args:
             context, source = args['parent_context'], 'provided'
         elif 'context_file' in args:
@@ -202,22 +208,14 @@ def start_agent(root, session, args):
                              'when this environment has no current Codex chat transcript, '
                              'or choose fork_turns=none for an independent task.')
     parent = sender()
-    inherited = {}
-    if parent != '/root':
+    inherited = inherited_state or {}
+    if inherited_state is None and parent != '/root':
         inherited = runner.snapshot(resolve(root, session, parent))
     options = args.get('agy', {})
-    prompt = f'You are {parent}/{args["task_name"]}, an agy subagent.\n{ROLES[role]}\n'
-    prompt += 'Parent context is historical reference. Complete the current task below.\n'
-    prompt += 'Local collaboration entrypoint (argv): ' + json.dumps(
-        [sys.executable, str(Path(__file__).with_name('agy_subagent.py'))]) + '\n'
-    prompt += ('Operations accept JSON from stdin. For an update to your parent, use send_message '
-               'with target ' + parent + ' and a message. Your final response is returned automatically.\n')
-    if context:
-        prompt += '\n<parent_context>\n' + context + '\n</parent_context>\n'
-    prompt += '\n<task>\n' + args['message'] + '\n</task>'
+    prompt = format_prompt(parent + '/' + args['task_name'], parent, role, args['message'], context)
     metadata = {'session_id': session, 'task_name': parent + '/' + args['task_name'],
                 'parent': parent, 'fork_turns': fork, 'context_source': source,
-                'pending_messages': [], 'closing': False}
+                'pending_messages': [], 'closing': False, 'forked_from': lineage}
     namespace = argparse.Namespace(
         cwd=args.get('cwd', inherited.get('cwd', str(Path.cwd()))),
         agy_bin=options.get('bin', inherited.get('agy_bin', 'agy')),
@@ -231,7 +229,9 @@ def start_agent(root, session, args):
         mode=options.get('mode', inherited.get('mode')),
         sandbox=options.get('sandbox', inherited.get('sandbox', False)),
         skip_permissions=options.get('skip_permissions', inherited.get('skip_permissions', False)),
-        timeout=options.get('timeout', inherited.get('timeout')), metadata=metadata)
+        timeout=options.get('timeout', inherited.get('timeout')), metadata=metadata,
+        history_seed=seed_snapshot if seed_snapshot is not None else {'context': context, 'turns': []},
+        logical_message=args['message'])
     with runner.locked(session_dir(root, session)):
         if any(state['task_name'] == metadata['task_name'] for state in states(root, session)):
             raise ValueError('task_name already exists under this parent. Reuse its handle or choose a new name.')
@@ -241,24 +241,38 @@ def start_agent(root, session, args):
                 agy_effort=state['effort'])
 
 
+def format_prompt(task_name, parent, role, message, context):
+    prompt = f'You are {task_name}, an agy subagent.\n{ROLES[role]}\n'
+    prompt += 'Parent context is historical reference. Complete the current task below.\n'
+    prompt += 'Local collaboration entrypoint (argv): ' + json.dumps(
+        [sys.executable, str(Path(__file__).with_name('agy_subagent.py'))]) + '\n'
+    prompt += ('Operations accept JSON from stdin. For an update to your parent, use send_message '
+               'with target ' + parent + ' and a message. Your final response is returned automatically.\n')
+    if context:
+        prompt += '\n<parent_context>\n' + context + '\n</parent_context>\n'
+    return prompt + '\n<task>\n' + message + '\n</task>'
+
+
 def launch_pending(directory, state):
     pending = state.get('pending_messages', [])
     if not pending:
         return state
-    prompt = '\n\n'.join(f'Message from {item["sender"]}\n{item["message"]}' for item in pending)
-    state['pending_messages'] = []
-    # An early interrupted first turn may have no conversation ID yet.
+    history_ops.ensure_history(directory, state)
+    message = '\n\n'.join(f'Message from {item["sender"]}\n{item["message"]}' for item in pending)
+    prompt = message
     if not state.get('conversation_id'):
-        initial = runner.read_json(directory / state['run_id'] / 'request.json')['prompt']
-        prompt = initial + '\n\n' + prompt
-    return runner.launch(directory, state, prompt)
+        context = history_ops.render(history_ops.snapshot(directory, state))
+        prompt = format_prompt(state['task_name'], state['parent'], state['role'], message, context)
+    state['pending_messages'] = []
+    return runner.launch(directory, state, prompt, message=message)
 
 
 def finish_turn(directory, run_id, state):
     """Advance queued work under the caller's agent lock and return a mailbox event."""
     output = runner.read_json(directory / run_id / 'result.json')
     event = {'type': 'final_answer', 'sender': state['task_name'], 'recipient': state['parent'],
-             'agent_id': state['id'], 'turn': state['turn'], 'status': state['status'],
+             'agent_id': state['id'], 'turn': state['turn'], 'turn_id': run_id,
+             'history_revision': state.get('history_revision', 0), 'status': state['status'],
              'message': (output.get('result') or {}).get('response', ''), 'error': output.get('error')}
     if (state['status'] == 'completed' and not state.get('closing')
             and not (directory / run_id / 'cancel').exists()):
@@ -336,6 +350,10 @@ def wait_updates(root, session, timeout_ms):
                     offset = handle.tell()
             runner.write_json(cursor_file, {'offset': offset})
         if updates or time.monotonic() >= deadline:
+            revisions = {item['id']: item.get('history_revision', 0) for item in states(root, session)}
+            for event in updates:
+                if event.get('type') == 'final_answer':
+                    event['superseded'] = event.get('history_revision', 0) != revisions.get(event['agent_id'], 0)
             return {'updates': updates, 'timed_out': not bool(updates)}
         time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
@@ -343,6 +361,8 @@ def wait_updates(root, session, timeout_ms):
 def dispatch(root, operation, args):
     validate(args, schemas()[operation])
     session = session_id()
+    if operation in history_ops.OPERATIONS:
+        return history_ops.dispatch(root, session, operation, args)
     if operation == 'spawn_agent':
         return start_agent(root, session, args)
     if operation == 'list_agents':
