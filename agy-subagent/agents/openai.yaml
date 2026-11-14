@@ -1,0 +1,3 @@
+interface:
+  display_name: "agy Subagent"
+  short_description: "Delegate tasks to Antigravity CLI with durable task handles"
