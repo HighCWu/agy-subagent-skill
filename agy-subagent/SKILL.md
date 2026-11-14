@@ -1,68 +1,86 @@
 ---
 name: agy-subagent
-description: Delegate scoped tasks to Antigravity CLI (agy) and manage them as background agents with task handles, parallel execution, status, results, conversation follow-ups, interruption, and closure. Use when the user requests agy or Antigravity delegation, implementation, investigation, review, or a second opinion.
+description: Use Antigravity CLI (agy) through Codex-shaped subagent operations and JSON arguments such as spawn_agent, send_message, followup_task, wait_agent, and interrupt_agent. Use when delegating implementation, investigation, review, or a second opinion to agy or Antigravity.
 ---
 
 # agy 子代理
 
-使用本机已安装并登录的 Antigravity CLI 完成明确的子任务。父代理负责分工、监控、核实结果和最终交付。
-
-## 准备和分工
-
-将本技能目录下 `scripts/agy_subagent.py` 的绝对路径记为 `AGY_RUNNER`。通过 `python3 "$AGY_RUNNER" --help` 查看命令，首次使用运行 `doctor`，并检查 `agy --help`。脚本需要 Python 3.10+ 和 POSIX 系统（Linux/macOS）。`doctor` 只检查程序是否存在，首次实际请求会验证登录状态。
-
-根据任务选择 `default`、`explorer`、`reviewer` 或 `worker`。角色是分工标签，其中 `worker` 默认使用 agy 的 `accept-edits` 模式，其他角色默认使用 `plan` 模式。可用 `--mode` 明确指定。权限与模式的区别见 [references/behavior.md](references/behavior.md)。
-
-提示词应包含以下信息，按实际需要取舍。
-
-- 子任务目标、输入文件、必要背景、验收条件和输出要求。
-- 当前工作目录、允许修改的文件或模块、相关项目规则。
-- 其他代理正在共同工作时，要求保留他们的修改，并协调接口。
-- 调查或评审任务明确要求仅返回结论，避免写操作。实现任务写明编辑范围和验证方法。
-
-父代理的上下文和工具权限需要显式传递。将必要背景写入提示词，避免依赖 agy 自动获得聊天历史。AGENTS.md 中适用的约束也要传入。使用文件传递长提示词，避免 shell 插值。按任务所需传递数据。
-
-## 启动与并行
+使用本技能目录内 `scripts/agy_subagent.py` 的绝对路径作为 `AGY_RUNNER`。操作名与 JSON 字段对齐 Codex 当前的 collaboration 接口。通过 shell 调用脚本，JSON 从 stdin、`--args-file PATH` 或 `--json` 读取。长消息和动态文本优先通过 stdin 或 JSON 文件传入。
 
 ```bash
-python3 "$AGY_RUNNER" spawn --cwd /absolute/project \
-  --name investigate-cache --role explorer \
-  --prompt-file /absolute/task-prompt.txt
+python3 "$AGY_RUNNER" spawn_agent <<'JSON'
+{"task_name":"investigate_cache","message":"调查缓存失效原因，只读取相关文件，返回路径和证据。","agent_type":"explorer","fork_turns":"all"}
+JSON
 ```
 
-返回 JSON 中的 `id` 是本地任务句柄。保留它，用于后续所有操作。不同任务可独立 `spawn` 并行运行。并行编辑应分配独立文件或使用已有的隔离工作目录，合并后核实差异。
+首次使用检查 `agy --help` 和脚本的 `doctor`。需要本机已登录的 agy、Python 3.10+ 和 Linux/macOS。`schemas` 返回各操作的完整 JSON Schema。
 
-可选参数包括 `--timeout`（每轮秒数，默认 600）、`--add-dir`（可重复）、`--project`、`--agent`、`--sandbox`、`--model`、`--effort`。模型和推理强度通常沿用 agy 配置，用户指定时通过 `agy models` 核实可用值。`--agent` 选择 agy 自身的 agent 配置，`--role` 是本脚本的任务标签。
+## 调用参数
 
-子任务沿用用户已经授予当前任务的工作范围。脚本通过 agy 自身执行工具操作，父代理的 sandbox 和审批设置需要单独考虑。`plan` 和提示词里的只读要求属于行为约束，权限隔离由运行环境和 agy 配置决定。只有用户明确要求跳过 agy 权限检查时才传入 `--skip-permissions`。遇到登录、权限或配额失败，读取错误并解决对应原因，保持授权范围。
+| 操作 | JSON 字段 | 行为 |
+| --- | --- | --- |
+| `spawn_agent` | `task_name`, `message`, 可选 `agent_type`, `fork_turns`, `model`, `reasoning_effort` | 启动代理，立即返回 `agent_id` 和规范任务路径 `task_name` |
+| `send_message` | `target`, `message` | 给运行中的代理排队补充消息，空闲代理只收信 |
+| `followup_task` | `target`, `message` | 空闲时启动新轮次，运行中排队追加任务 |
+| `interrupt_agent` | `target` | 中断当前轮次，返回 `previous_status` 与当前状态 |
+| `list_agents` | 可选 `path_prefix` | 列出当前聊天的代理，可按任务路径筛选 |
+| `wait_agent` | 可选 `timeout_ms` | 等待当前代理邮箱中的新消息或结果，默认 30000 毫秒 |
+| `close_agent` | `target` | 停止工作并关闭句柄，保留会话与记录 |
+| `resume_agent` | `target` | 恢复已关闭句柄，后续用 `followup_task` 分配工作 |
 
-## 等待与收集
+`task_name` 使用小写字母、数字、下划线，同一父代理下唯一。`target` 可使用返回的 ID、相对任务名或 `/root/investigate_cache` 这样的规范路径。嵌套代理的任务路径随父代理扩展，跨分支消息使用规范路径。子代理可通过 `send_message` 给父代理或其他代理发送信息，消息来源和会话由运行环境记录。
+
+`agent_type` 默认 `default`，支持 `worker`、`explorer`、`reviewer`。角色职责会实际注入 agy 提示词。`worker` 要求保留其他人的修改并验证实现，`explorer` 和 `reviewer` 要求使用只读操作。模式与权限由 agy 配置决定，角色要求属于提示词约束。
+
+`model` 传给 agy 的 `--model`，使用 `agy models` 中的模型 ID。`reasoning_effort` 传给 `--effort`，支持 `low`、`medium`、`high`、`xhigh`、`max`。`ultra` 映射为 agy 的 `max`，返回值会报告实际 `agy_effort`。省略时沿用 agy 配置，嵌套代理沿用父 agy 代理的设置。
+
+## 上下文和工作区
+
+`fork_turns` 默认 `all`。在本地 Codex 中，脚本根据当前聊天 ID 读取本聊天已落盘的用户与助手文本，并作为父上下文传入。嵌套 agy 代理读取其父代理的任务与回答。传入 `none` 可创建独立任务。
+
+当前环境缺少可读聊天记录时，使用扩展参数 `parent_context` 或 `context_file` 提供上下文，或按任务需要明确选择 `none`。返回的 `context_source` 说明上下文来源。系统指令、隐藏推理、工具配置、权限和审批设置需要按 agy 的执行环境处理。把任务所需的项目约束、文件所有权、目标和验收条件写入 `message`。
+
+工作目录默认使用调用位置，嵌套代理继承父工作目录，也可通过扩展字段 `cwd` 指定。独立子任务可并行 `spawn_agent`。协作编辑时在 `message` 中分配文件责任，并检查合并后的实际差异。
+
+agy 特有选项放入可选 `agy` 对象。
+
+```json
+{
+  "task_name": "fix_cache",
+  "message": "修复 src/cache.py 中的失效问题，保留其他人的修改并执行现有测试。",
+  "agent_type": "worker",
+  "fork_turns": "none",
+  "cwd": "/absolute/project",
+  "model": "an-id-from-agy-models",
+  "reasoning_effort": "high",
+  "agy": {"mode": "accept-edits", "timeout": 900}
+}
+```
+
+`agy` 支持 `bin`、`mode`、`agent`、`project`、`add_dir`、`sandbox`、`skip_permissions`、`timeout`。新接口默认沿用 agy 模式，并等待任务完成。`timeout` 可显式设置每轮秒数。`skip_permissions` 映射到 `--dangerously-skip-permissions`，启用后自动批准 agy 工具请求，按当前任务授权和执行环境选择。
+
+## 消息与等待
 
 ```bash
-python3 "$AGY_RUNNER" status TASK_ID
-python3 "$AGY_RUNNER" list
-python3 "$AGY_RUNNER" wait TASK_ID --timeout 30
-python3 "$AGY_RUNNER" result TASK_ID
+python3 "$AGY_RUNNER" send_message <<'JSON'
+{"target":"investigate_cache","message":"补充检查并发写入场景。"}
+JSON
+python3 "$AGY_RUNNER" followup_task <<'JSON'
+{"target":"investigate_cache","message":"依据调查结果实现修复，修改范围为 src/cache.py。"}
+JSON
+python3 "$AGY_RUNNER" wait_agent <<'JSON'
+{"timeout_ms":30000}
+JSON
 ```
 
-`wait` 最多等待 60 秒，超时返回当前状态，任务继续运行。可以在等待间隙处理独立工作。用户要求完整交付时，持续跟进到全部相关任务结束。`completed`、`failed`、`timed_out`、`interrupted`、`closed` 为终止状态。
+运行中消息由持久队列保存，在当前 agy print 轮次结束后自动投递到同一 conversation 的下一轮。需要立即改变方向时，调用 `interrupt_agent` 后使用 `followup_task`。首次初始化前中断导致 conversation ID 尚未生成时，续接会携带原任务和补充消息启动。
 
-`result` 返回任务信息、结构化 agy 结果和 `artifacts_dir`。最终回答位于 `output.result.response`。失败时查看 `output.error`、该目录中的 `stderr.log`、`events.ndjson` 和 `supervisor.log`。原始事件可用于了解执行进展。空回答、缺少 result 事件或失败状态会记为 `failed`，保留日志供诊断。
+`wait_agent` 等待当前会话中发给调用方的任一新消息，返回 `updates`，超时返回 `timed_out=true`。每个代理拥有独立邮箱游标，已读取事件会被消费。`timeout_ms=0` 可立即收取已到达的更新。
 
-对结论检查文件和证据。对代码修改检查实际 diff 并执行适用的验证。父代理负责处理任务间冲突和后续修复。
+结果事件包含 `sender`、`agent_id`、`turn`、`status`、`message`、`error` 和 `more_work`。`more_work=true` 表示该结果后还有已启动的排队工作。使用 `list_agents` 确认相关代理均完成，并核查实际文件和验证结果后整合交付。父代理负责持续监控用户要求完成的所有工作。
 
-## 续接、中断与关闭
+会话默认根据 `CODEX_THREAD_ID` 隔离，agy 子代理自动继承所属会话。脱离 Codex 时，可设置固定 `AGY_SUBAGENT_SESSION` 以便跨目录访问同一组代理。
 
-```bash
-python3 "$AGY_RUNNER" send TASK_ID --prompt-file /absolute/follow-up.txt
-python3 "$AGY_RUNNER" interrupt TASK_ID
-python3 "$AGY_RUNNER" close TASK_ID
-```
+状态与日志默认保存在 `~/.local/state/agy-subagent/`。顶层参数 `--state-dir` 或环境变量 `AGY_SUBAGENT_STATE_DIR` 可更改位置。诊断时可调用旧接口 `result AGENT_ID` 查看本轮结构化结果与日志目录。关闭和中断保留已有修改及记录，重试前核查副作用。
 
-`send` 在同一 conversation ID 上启动下一轮，保留任务目录与配置。它要求前一轮已经结束，运行中的任务需先等待或 `interrupt`。需马上改变方向时，中断后发送补充指令。首次初始化前中断可能尚无 conversation ID，此时用已知背景启动新任务。
-
-`interrupt` 请求停止该任务当前的 agy 进程组，保留日志和已获得的 conversation ID。已发生的文件修改仍需检查。`close` 在停止当前轮次后封闭本地句柄，保留 agy 会话及本地记录。关闭的句柄可用于读取结果，后续新任务使用 `spawn`。
-
-每轮的事件、提示词和结果默认保存在 `~/.local/state/agy-subagent/`。可通过顶层参数 `--state-dir` 或环境变量 `AGY_SUBAGENT_STATE_DIR` 更改位置，同一个任务的操作需使用相同位置。共享状态目录中的操作通过文件锁串行化。重试有副作用的失败任务前，检查实际修改和日志。
-
-需要了解与 Codex 子代理的能力对应、兼容性或实现机制时，阅读 [references/behavior.md](references/behavior.md)。
+接口差异、状态恢复和旧版命令说明见 [references/behavior.md](references/behavior.md)。

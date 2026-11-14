@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Durable local task handles for Antigravity CLI. Python 3.10+, POSIX."""
 import argparse
-from contextlib import contextmanager
+import array
+from contextlib import contextmanager, ExitStack
 import fcntl
 import json
 import os
@@ -11,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import termios
 import time
 import uuid
 
@@ -101,16 +103,22 @@ def spawn(args, root):
     state = dict(id=task_id, name=args.name, role=args.role, cwd=str(cwd),
                  agy_bin=str(Path(binary).resolve()), model=args.model, effort=args.effort,
                  agent=args.agent, project=args.project, add_dir=args.add_dir,
-                 mode=args.mode or ('accept-edits' if args.role == 'worker' else 'plan'),
+                 mode=args.mode if hasattr(args, 'metadata') else (args.mode or ('accept-edits' if args.role == 'worker' else 'plan')),
                  sandbox=args.sandbox, skip_permissions=args.skip_permissions,
                  timeout=args.timeout, conversation_id=None)
+    state.update(getattr(args, 'metadata', {}))
     with locked(directory):
         return launch(directory, state, prompt)
 
 
 def build_command(state, request):
     command = [state['agy_bin'], '--print', request['prompt'], '--output-format', 'stream-json',
-               '--disable-slash-commands', '--mode', state['mode'], '--print-timeout', '0']
+               '--disable-slash-commands', '--print-timeout', '0']
+    if state.get('session_id'):
+        command[2] = ''
+        command += ['--input-format', 'stream-json']
+    if state['mode']:
+        command += ['--mode', state['mode']]
     if request['conversation_id']:
         command += ['--conversation', request['conversation_id']]
     for field in ('model', 'effort', 'agent', 'project'):
@@ -126,22 +134,27 @@ def build_command(state, request):
 
 
 def stop_process(process):
-    # Only signal the process group created by this supervisor.
-    if process.poll() is not None:
-        return
+    # The leader can exit while descendants still own its stdout or keep working.
+    # This group was created by this supervisor with start_new_session=True.
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         process.wait()
         return
-    try:
-        process.wait(timeout=3)
-    except subprocess.TimeoutExpired:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        process.poll()  # Reap the group leader so its zombie does not keep the group alive.
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, 0)
         except ProcessLookupError:
-            pass
-        process.wait()
+            process.wait()
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
 
 
 def supervise(root, args):
@@ -163,15 +176,30 @@ def supervise(root, args):
     error = None
     process = None
     try:
-        with (run / 'events.ndjson').open('ab') as events, (run / 'stderr.log').open('ab') as stderr:
-            process = subprocess.Popen(build_command(state, request), cwd=state['cwd'],
-                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        with ExitStack() as stack:
+            events = stack.enter_context((run / 'events.ndjson').open('ab'))
+            stderr = stack.enter_context((run / 'stderr.log').open('ab'))
+            input_stream = subprocess.DEVNULL
+            if state.get('session_id'):
+                # File-backed stdin avoids both argv limits and blocking pipe writes.
+                payload = {'event': 'user', 'message': {'role': 'user', 'content': request['prompt']}}
+                input_path = run / 'input.ndjson'
+                input_path.write_text(json.dumps(payload, ensure_ascii=False) + '\n')
+                input_stream = stack.enter_context(input_path.open('rb'))
+            environment = os.environ.copy()
+            if state.get('session_id'):
+                environment.update(AGY_SUBAGENT_SESSION=state['session_id'],
+                                   AGY_SUBAGENT_PARENT_PATH=state['task_name'],
+                                   AGY_SUBAGENT_STATE_DIR=str(root))
+            process = subprocess.Popen(build_command(state, request), cwd=state['cwd'], env=environment,
+                                       stdin=input_stream, stdout=subprocess.PIPE,
                                        stderr=stderr, start_new_session=True, close_fds=True)
             selector = selectors.DefaultSelector()
             selector.register(process.stdout, selectors.EVENT_READ)
             pending = b''
-            deadline = time.monotonic() + state['timeout']
+            deadline = time.monotonic() + state['timeout'] if state['timeout'] else float('inf')
             eof = False
+            bytes_after_exit = None
             while not eof:
                 if interrupted or (run / 'cancel').exists():
                     status = 'interrupted'
@@ -180,8 +208,20 @@ def supervise(root, args):
                     status = 'timed_out'
                     error = 'Turn exceeded the configured timeout'
                     break
-                for key, _ in selector.select(timeout=0.2):
-                    chunk = os.read(key.fileobj.fileno(), 65536)
+                if bytes_after_exit is None and process.poll() is not None:
+                    # Snapshot buffered bytes after all leader writes have completed.
+                    # Descendants can keep this pipe open and produce data indefinitely.
+                    available = array.array('i', [0])
+                    fcntl.ioctl(process.stdout.fileno(), termios.FIONREAD, available, True)
+                    bytes_after_exit = available[0]
+                if bytes_after_exit == 0:
+                    break
+                ready = selector.select(timeout=0.2)
+                for key, _ in ready:
+                    read_size = 65536 if bytes_after_exit is None else min(65536, bytes_after_exit)
+                    chunk = os.read(key.fileobj.fileno(), read_size)
+                    if bytes_after_exit is not None:
+                        bytes_after_exit -= len(chunk)
                     if not chunk:
                         eof = True
                         break
@@ -226,12 +266,18 @@ def supervise(root, args):
         if process is not None:
             stop_process(process)
         write_json(run / 'result.json', {'status': status, 'result': result, 'error': error})
+        event = None
         with locked(directory):
             current = read_json(directory / 'state.json')
             if current['run_id'] == args.run_id:
                 current.update(status=status, conversation_id=conversation_id, error=error,
                                finished_at=time.time(), exit_code=process.returncode if process else None)
+                if current.get('session_id'):
+                    import collaboration_api
+                    event = collaboration_api.finish_turn(directory, args.run_id, current)
                 write_json(directory / 'state.json', current)
+        if event:
+            collaboration_api.publish(root, current['session_id'], event)
 
 
 def finite_positive(value):
@@ -270,6 +316,13 @@ def main():
     start.add_argument('--timeout', type=finite_positive, default=600)
     commands.add_parser('list')
     commands.add_parser('doctor')
+    commands.add_parser('schemas', help='Show Codex-shaped JSON argument schemas')
+    import collaboration_api
+    for operation in collaboration_api.OPERATIONS:
+        command = commands.add_parser(operation, help='Codex-shaped JSON operation')
+        source = command.add_mutually_exclusive_group()
+        source.add_argument('--json', help='Inline JSON arguments')
+        source.add_argument('--args-file', help='JSON file, or - for stdin')
     for name in ('status', 'result', 'interrupt', 'close', 'send', 'wait'):
         command = commands.add_parser(name)
         command.add_argument('id')
@@ -283,6 +336,18 @@ def main():
     args = parser.parse_args()
     root = Path(args.state_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if args.command == 'schemas':
+        emit(collaboration_api.schemas())
+        return
+    if args.command in collaboration_api.OPERATIONS:
+        if args.json is not None:
+            arguments = json.loads(args.json)
+        elif args.args_file and args.args_file != '-':
+            arguments = read_json(Path(args.args_file))
+        else:
+            arguments = json.loads(sys.stdin.read() or '{}')
+        emit(collaboration_api.dispatch(root, args.command, arguments))
+        return
     if args.command == '_run':
         supervise(root, args)
         return
