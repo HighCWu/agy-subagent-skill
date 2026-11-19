@@ -50,7 +50,7 @@ class Collaboration(unittest.TestCase):
         self.binary.write_text(FAKE)
         self.binary.chmod(0o700)
         self.environment = dict(os.environ, AGY_SUBAGENT_SESSION='test-session',
-                                AGY_SUBAGENT_PARENT_PATH='/root')
+                                AGY_SUBAGENT_PARENT_PATH='/root', AGY_SUBAGENT_RESTORE_PRINT='1')
         self.ids = []
 
     def tearDown(self):

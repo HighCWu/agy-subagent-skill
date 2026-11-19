@@ -13,6 +13,8 @@ python3 "$AGY_RUNNER" spawn_agent <<'JSON'
 JSON
 ```
 
+默认通过持久化后台 PTY 运行交互式 agy；无需 Xvfb、DISPLAY、终端窗口或 xdotool。原 print/stream-json 通道默认禁用，仅在用户要求恢复时显式启用。
+
 首次使用检查 `agy --help` 和脚本的 `doctor`。需要本机已登录的 agy、Python 3.10+ 和 Linux/macOS。`schemas` 返回各操作的完整 JSON Schema。
 
 ## 调用参数
@@ -57,7 +59,7 @@ agy 特有选项放入可选 `agy` 对象。
 }
 ```
 
-`agy` 支持 `bin`、`mode`、`agent`、`project`、`add_dir`、`sandbox`、`skip_permissions`、`timeout`。新接口默认沿用 agy 模式，并等待任务完成。`timeout` 可显式设置每轮秒数。`skip_permissions` 映射到 `--dangerously-skip-permissions`，启用后自动批准 agy 工具请求，按当前任务授权和执行环境选择。
+`agy` 支持 `bin`、`mode`、`agent`、`project`、`add_dir`、`sandbox`、`skip_permissions`、`timeout`、`data_dir`。`data_dir` 指定只读结果数据库目录，默认 `~/.gemini/antigravity-cli`，必须与 agy 实际存储位置一致。新接口默认沿用 agy 模式，并等待任务完成。`timeout` 可显式设置每轮秒数。`skip_permissions` 映射到 `--dangerously-skip-permissions`，启用后自动批准 agy 工具请求，按当前任务授权和执行环境选择。
 
 ## 消息与等待
 
@@ -73,7 +75,7 @@ python3 "$AGY_RUNNER" wait_agent <<'JSON'
 JSON
 ```
 
-运行中消息由持久队列保存，在当前 agy print 轮次结束后自动投递到同一 conversation 的下一轮。需要立即改变方向时，调用 `interrupt_agent` 后使用 `followup_task`。首次初始化前中断导致 conversation ID 尚未生成时，续接会携带原任务和补充消息启动。
+运行中消息由持久队列保存，在当前 agy 交互轮次结束后自动投递到同一 conversation 的下一轮。需要立即改变方向时，调用 `interrupt_agent` 后使用 `followup_task`。首次初始化前中断导致 conversation ID 尚未生成时，续接会携带原任务和补充消息启动。
 
 `wait_agent` 等待当前会话中发给调用方的任一新消息，返回 `updates`，超时返回 `timed_out=true`。每个代理拥有独立邮箱游标，已读取事件会被消费。`timeout_ms=0` 可立即收取已到达的更新。
 
@@ -98,3 +100,11 @@ JSON
 使用这些扩展时阅读 [references/history.md](references/history.md)，了解边界选择、摘要示例、旧记录迁移与历史恢复。
 
 接口差异、状态恢复和旧版命令说明见 [references/behavior.md](references/behavior.md)。
+
+## 终端诊断与恢复旧通道
+
+工作区信任、登录或工具确认可能使交互停住。使用 `terminal_status {"target":"task_name"}` 读取终端输出与 `needs_input`；用 `terminal_input` 传入 `text`、可选 `submit`，或单个 `key`（`enter`、`escape`、`ctrl_c`、`ctrl_d`、`up`、`down`、`tab`）。按当前授权处理提示，不要为推进任务擅自跳过确认。终端输出用于诊断，最终回答通过带本轮标记的数据库记录读取。
+
+PTY 在多轮之间存活，`close_agent` 关闭它；中断会结束当前终端及其进程组，之后根据已捕获 conversation ID 续接。会话恢复依赖 agy 原生持久化数据。数据库适配器只读 SQLite，schema 或 protobuf 格式不兼容时报告错误，不回退到 print，也不修改原始数据库。
+
+恢复旧通道：`configure_backend {"backend":"print"}`；重新禁用：`configure_backend {"backend":"pty"}`。设置保存在状态根目录 `backend.json`，影响之后启动的轮次；已有运行中的轮次继续使用原通道。显式环境变量 `AGY_SUBAGENT_RESTORE_PRINT=1` 也可恢复 print，主要用于兼容性测试。仅在用户明确要求恢复时启用。交互式启动并不能证明第三方编排符合服务条款或避免封控。

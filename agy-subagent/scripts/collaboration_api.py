@@ -37,8 +37,16 @@ OPERATIONS = {
                                                'maximum': 3600000}}},
 }
 OPERATIONS.update(history_ops.OPERATIONS)
+OPERATIONS.update({
+    'configure_backend': {'required': ['backend'], 'properties': {
+        'backend': {'type': 'string', 'enum': ['pty', 'print']}}},
+    'terminal_status': {'required': ['target'], 'properties': {'target': {'type': 'string'}}},
+    'terminal_input': {'required': ['target'], 'properties': {
+        'target': {'type': 'string'}, 'text': {'type': 'string'}, 'submit': {'type': 'boolean'},
+        'key': {'type': 'string', 'enum': ['enter', 'escape', 'ctrl_c', 'ctrl_d', 'up', 'down', 'tab']}}},
+})
 AGY_OPTIONS = {
-    'bin': {'type': 'string'}, 'mode': {'type': 'string', 'enum': ['plan', 'accept-edits', 'auto']},
+    'data_dir': {'type': 'string'}, 'bin': {'type': 'string'}, 'mode': {'type': 'string', 'enum': ['plan', 'accept-edits', 'auto']},
     'agent': {'type': 'string'}, 'project': {'type': 'string'},
     'add_dir': {'type': 'array', 'items': {'type': 'string'}},
     'sandbox': {'type': 'boolean'}, 'skip_permissions': {'type': 'boolean'},
@@ -229,6 +237,7 @@ def start_agent(root, session, args, seed_snapshot=None, lineage=None, inherited
         mode=options.get('mode', inherited.get('mode')),
         sandbox=options.get('sandbox', inherited.get('sandbox', False)),
         skip_permissions=options.get('skip_permissions', inherited.get('skip_permissions', False)),
+        data_dir=options.get('data_dir', inherited.get('data_dir')),
         timeout=options.get('timeout', inherited.get('timeout')), metadata=metadata,
         history_seed=seed_snapshot if seed_snapshot is not None else {'context': context, 'turns': []},
         logical_message=args['message'])
@@ -330,6 +339,9 @@ def control(root, session, operation, target):
                 state['status_before_close'] = state['status']
             state['status'] = 'closed'
             runner.write_json(directory / 'state.json', state)
+    if operation == 'close_agent':
+        import pty_backend
+        pty_backend.close_terminal(directory)
     return dict(view(state), previous_status=previous)
 
 
@@ -361,6 +373,20 @@ def wait_updates(root, session, timeout_ms):
 def dispatch(root, operation, args):
     validate(args, schemas()[operation])
     session = session_id()
+    if operation == 'configure_backend':
+        import backend_policy
+        return backend_policy.configure(root, args['backend'])
+    if operation in ('terminal_status', 'terminal_input'):
+        import pty_backend
+        directory = resolve(root, session, args['target'])
+        if operation == 'terminal_status':
+            try:
+                return pty_backend.request(directory, {'op': 'status'})
+            except (OSError, ValueError):
+                return {'backend': 'pty', 'running': False, 'ready': False}
+        if ('text' in args) == ('key' in args):
+            raise ValueError('Provide exactly one of text or key')
+        return pty_backend.request(directory, dict(op='input', **{k: v for k, v in args.items() if k != 'target'}))
     if operation in history_ops.OPERATIONS:
         return history_ops.dispatch(root, session, operation, args)
     if operation == 'spawn_agent':

@@ -55,7 +55,7 @@ JSON
 
 `cwd` 指定工作目录，`agy` 对象承载提供方选项，例如 `{"mode":"accept-edits","timeout":900}`。默认沿用 agy 配置并等待完成。`model` 使用 `agy models` 中的 ID，`reasoning_effort=ultra` 会映射到 agy 的 `max`。`schemas` 返回完整参数定义。
 
-本实现通过本地脚本和 agy print 协议编排。消息在完整轮次边界投递，即时改向可中断后追加任务。操作结果通过脚本返回。详细语义与原生运行时差异见 [技能说明](agy-subagent/SKILL.md) 和 [接口与运行边界](agy-subagent/references/behavior.md)。旧版 CLI 命令和任务记录继续兼容。
+本实现通过持久化后台 PTY 操作交互式 agy，通过只读 SQLite 数据库获取本轮回答。无需 Xvfb、DISPLAY 或 xdotool。旧 print/stream-json 通道默认禁用，可显式恢复。消息在完整轮次边界投递，即时改向可中断后追加任务。操作结果通过脚本返回。详细语义与原生运行时差异见 [技能说明](agy-subagent/SKILL.md) 和 [接口与运行边界](agy-subagent/references/behavior.md)。旧版 CLI 命令和任务记录继续兼容。
 
 ## 历史分叉和上下文压缩
 
@@ -87,3 +87,9 @@ python3 -m unittest discover -s tests -v
 测试覆盖 JSON 参数、角色指令、上下文分支、聊天隔离、消息邮箱、并发追加、关闭恢复、历史分叉、指定轮次重试、摘要上下文、回退隔离、历史恢复及旧记录迁移。开发中也验证了真实 agy 的运行中排队与同会话续接。
 
 参考 [Codex 子代理官方文档](https://learn.chatgpt.com/docs/agent-configuration/subagents) 和 [sysCat64/codex-agy-plugin](https://github.com/sysCat64/codex-agy-plugin) 的 print 模式集成思路。
+
+## 后台终端
+
+每个代理持有一个独立 PTY，会话在多轮间保持。`terminal_status {"target":"investigate_cache"}` 可查看终端输出；`terminal_input {"target":"investigate_cache","key":"enter"}` 等操作可按实际提示处理工作区信任或确认。中断关闭当前终端，后续任务根据 conversation ID 恢复；`close_agent` 清理终端。
+
+恢复旧通道使用 `configure_backend {"backend":"print"}`，重新禁用使用 `configure_backend {"backend":"pty"}`，参数通过 stdin JSON 传入脚本。设置影响后续轮次。默认数据库目录为 `~/.gemini/antigravity-cli`，可通过 `agy.data_dir` 指定实际位置。当前数据库适配器实测 agy 1.5.12，内部 schema 变化时需要更新适配器，失败不会自动切回 print。更换交互通道本身不保证符合服务条款或避免封控。

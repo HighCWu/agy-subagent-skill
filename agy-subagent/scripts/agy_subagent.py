@@ -68,6 +68,8 @@ def prompt_from(args):
 
 
 def launch(directory, state, prompt, message=None):
+    import backend_policy
+    state['backend'] = backend_policy.selection(directory.parent)
     run_id = uuid.uuid4().hex
     run = directory / run_id
     run.mkdir(mode=0o700)
@@ -112,7 +114,8 @@ def spawn(args, root):
                  agent=args.agent, project=args.project, add_dir=args.add_dir,
                  mode=args.mode if hasattr(args, 'metadata') else (args.mode or ('accept-edits' if args.role == 'worker' else 'plan')),
                  sandbox=args.sandbox, skip_permissions=args.skip_permissions,
-                 timeout=args.timeout, conversation_id=None)
+                 timeout=args.timeout, conversation_id=None,
+                 data_dir=getattr(args, 'data_dir', None))
     state.update(getattr(args, 'metadata', {}))
     with locked(directory):
         if hasattr(args, 'history_seed'):
@@ -168,7 +171,7 @@ def stop_process(process):
     process.wait()
 
 
-def supervise(root, args):
+def supervise_print(root, args):
     directory = task_dir(root, args.id)
     run = directory / args.run_id
     state = snapshot(directory)
@@ -291,6 +294,40 @@ def supervise(root, args):
             collaboration_api.publish(root, current['session_id'], event)
 
 
+def supervise(root, args):
+    directory = task_dir(root, args.id)
+    state = snapshot(directory)
+    if state.get('backend') == 'print':
+        import pty_backend
+        pty_backend.close_terminal(directory)
+        return supervise_print(root, args)
+    import pty_backend
+    run = directory / args.run_id
+    def cancel(signum, frame):
+        (run / 'cancel').touch()
+    signal.signal(signal.SIGTERM, cancel)
+    signal.signal(signal.SIGINT, cancel)
+    try:
+        outcome = pty_backend.run_turn(directory, args.run_id)
+    except Exception as error:
+        outcome = {'status': 'failed', 'result': None, 'error': str(error)}
+        pty_backend.close_terminal(directory)
+    write_json(run / 'result.json', outcome)
+    event = None
+    with locked(directory):
+        current = read_json(directory / 'state.json')
+        if current['run_id'] == args.run_id:
+            current.update(status=outcome['status'], error=outcome.get('error'), finished_at=time.time())
+            if outcome.get('conversation_id'):
+                current['conversation_id'] = outcome['conversation_id']
+            if current.get('session_id'):
+                import collaboration_api
+                event = collaboration_api.finish_turn(directory, args.run_id, current)
+            write_json(directory / 'state.json', current)
+    if event:
+        collaboration_api.publish(root, current['session_id'], event)
+
+
 def finite_positive(value):
     import math
     number = float(value)
@@ -363,9 +400,10 @@ def main():
         supervise(root, args)
         return
     if args.command == 'doctor':
+        import backend_policy
         binary = shutil.which('agy')
         emit({'agy': binary, 'python': sys.version.split()[0], 'state_dir': str(root),
-              'platform': sys.platform, 'ready': bool(binary),
+              'platform': sys.platform, 'ready': bool(binary), 'backend': backend_policy.selection(root),
               'next': 'Check agy --help and agy models. Authentication is checked on the first turn.'})
         return
     if args.command == 'spawn':
@@ -417,6 +455,8 @@ def main():
                     raise ValueError('Cancellation pending. Check status before closing again.')
                 state['status'] = 'closed'
                 write_json(directory / 'state.json', state)
+            import pty_backend
+            pty_backend.close_terminal(directory)
         emit(state)
 
 

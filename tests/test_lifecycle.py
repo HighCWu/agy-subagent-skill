@@ -49,7 +49,8 @@ class Lifecycle(unittest.TestCase):
 
     def call(self, *args, check=True):
         process = subprocess.run([sys.executable, str(SCRIPT), '--state-dir', str(self.root), *args],
-                                 capture_output=True, text=True, timeout=12)
+                                 capture_output=True, text=True, timeout=12,
+                                 env=dict(os.environ, AGY_SUBAGENT_RESTORE_PRINT='1'))
         if check:
             self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         return json.loads(process.stdout)

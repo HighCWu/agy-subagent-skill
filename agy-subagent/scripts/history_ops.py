@@ -223,7 +223,7 @@ def branch(directory, state, operation, args):
         message = args['message']
         source_turn = selected['turns'][-1]['turn_id'] if selected['turns'] else None
     context = choose_context(selected, args)
-    options = {key: state[key] for key in ('mode', 'agent', 'project', 'timeout') if state.get(key) is not None}
+    options = {key: state[key] for key in ('mode', 'agent', 'project', 'timeout', 'data_dir') if state.get(key) is not None}
     options.update(bin=state['agy_bin'], add_dir=state['add_dir'], sandbox=state['sandbox'],
                    skip_permissions=state['skip_permissions'])
     options.update(args.get('agy', {}))
